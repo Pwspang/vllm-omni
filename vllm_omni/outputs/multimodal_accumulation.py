@@ -75,14 +75,14 @@ _NEMOTRON_SNAPSHOT_KEYS = frozenset(
 
 # NemotronVoiceChat thinker per-frame client keys (its
 # ``omni_client_multimodal_output_keys``): each step carries that frame's
-# function-channel token and, while a tool result is queued, its consumed
-# generation. Neither is a stream to concatenate, so a DELTA emission drains
-# them; otherwise every completion would repeat the session's history and a
-# stale acknowledgement.
+# function-channel token, step flags, and result ownership acknowledgement.
+# Drain all of them after DELTA emission to avoid replaying state on later frames.
 _NEMOTRON_PER_FRAME_KEYS = frozenset(
     {
         "nvc_function_token",
+        "nvc_function_token_forced",
         "nvc_function_response_consumed_generation",
+        "nvc_tool_step",
     }
 )
 

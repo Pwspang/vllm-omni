@@ -355,6 +355,7 @@ class DuplexSessionRunner:
             close_from_runtime=self._close_from_runtime,
             schedule_silence_continuation=self._schedule_silence_continuation,
             abort_request=self._abort_request_background,
+            schedule_fast_tool_step=self._schedule_fast_tool_step,
         )
         self.control = SessionControl(
             self.ctx,
@@ -1588,6 +1589,10 @@ class DuplexSessionRunner:
             )
             if candidate is not None:
                 session.replace_runtime_config(deepcopy(candidate))
+                # Timeout/cancel notices use the same model-owned result
+                # channel as accepted client output. Wake that channel even
+                # when the microphone and ordinary silence continuation stop.
+                await self.model.continue_fast_tool_steps(session.epoch)
         except Exception as exc:
             logger.exception("Failed to apply tool-call settlement: %s", exc)
             self._emit_error(
@@ -1828,6 +1833,10 @@ class DuplexSessionRunner:
                 clock.note_input_audio(
                     ack, samples=helpers.pcm_sample_count(audio, fmt), sample_rate_hz=int(sample_rate_hz)
                 )
+            # Keep input-clock duration and ordered acknowledgements, but do
+            # not retain microphone audio or run VAD during internal tool work.
+            if self.plugin.has_fast_tool_steps(session.runtime_config):
+                return
             try:
                 detected = await self.control.run_turn_detection(event)
             except TurnDetectionAudioError as exc:
@@ -2483,6 +2492,42 @@ class DuplexSessionRunner:
             await asyncio.wait({append}, timeout=_INPUT_CLOCK_CHECK_INTERVAL_S)
         return True
 
+    async def _schedule_fast_tool_step(self, payload: dict[str, object], epoch: int) -> bool:
+        """Internal steps share append fencing and sequencing, without audio pacing."""
+
+        def still_valid() -> bool:
+            return (
+                self.session.epoch == epoch
+                and not self.run.closing
+                and self.plugin.has_fast_tool_steps(self.session.runtime_config)
+            )
+
+        if not still_valid():
+            return False
+        submitted = False
+
+        def accepted(submit_time: float) -> None:
+            nonlocal submitted
+            submitted = True
+
+        def release_if_unsubmitted(done: asyncio.Task[bool]) -> None:
+            if submitted:
+                return
+            retry = not done.cancelled() and done.exception() is None and done.result()
+            if not done.cancelled() and not retry and self.session.epoch == epoch and not self.run.closing:
+                self._fail_session_from_append("runtime_append_failed")
+            self.model.release_unsubmitted_tool_step(epoch, retry=retry)
+
+        task = await self._start_append(
+            payload,
+            final=False,
+            silence_continuation=True,
+            before_append=still_valid,
+            on_append_accepted=accepted,
+        )
+        task.add_done_callback(release_if_unsubmitted)
+        return True
+
     async def _schedule_silence_continuation(
         self,
         payload: object,
@@ -2497,6 +2542,8 @@ class DuplexSessionRunner:
         session = self.session
         model_state = self.model_state
         if not self._silence_continuation_enabled():
+            return False
+        if self.plugin.has_fast_tool_steps(session.runtime_config):
             return False
         # Captured before every await. A continuation that stores the slot
         # while this one waits is newer, even when both saw append_tail None
@@ -2581,6 +2628,7 @@ class DuplexSessionRunner:
                 # Still allowed: a session.update may have turned continuation off
                 # while this unit waited behind the append in flight.
                 self._silence_continuation_enabled()
+                and not self.plugin.has_fast_tool_steps(session.runtime_config)
                 # The anchor changed (a real append was accepted) after this
                 # continuation was planned; the unit is outdated.
                 and model_state.last_native_submit_monotonic == anchor

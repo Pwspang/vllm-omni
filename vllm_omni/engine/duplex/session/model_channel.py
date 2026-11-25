@@ -184,12 +184,15 @@ class ModelChannel:
         close_from_runtime: Callable[[str], Awaitable[None]],
         schedule_silence_continuation: SilenceContinuationScheduler,
         abort_request: Callable[..., Awaitable[None]],
+        schedule_fast_tool_step: Callable[[dict[str, object], int], Awaitable[bool]] | None = None,
     ) -> None:
         self._ctx = ctx
         self._out = out
         self._close_from_runtime = close_from_runtime
         self._schedule_silence_continuation = schedule_silence_continuation
         self._abort_request = abort_request
+        self._schedule_fast_tool_step = schedule_fast_tool_step
+        self._fast_tool_step_epoch: int | None = None
         self._input_transcriptions: dict[str, CommittedInputContinuation] = {}
         self._deferred_text_listen: tuple[int, dict[str, object]] | None = None
 
@@ -855,6 +858,12 @@ class ModelChannel:
         )
         if runtime_config is not None:
             session.replace_runtime_config(runtime_config)
+        if (
+            self._schedule_fast_tool_step is not None
+            and item.stage_id == 0
+            and self._ctx.plugin.is_fast_tool_step_output(item.context.segment_output_metadata)
+        ):
+            self._fast_tool_step_epoch = None
         drain_result = {"data_plane_outputs": [engine_output]}
         close_reason, emitted_response = await self._send_model_output_events(
             drain_result, expected_epoch=expected_epoch, model_turn_id=item.context.model_turn_id
@@ -864,6 +873,16 @@ class ModelChannel:
         if close_reason is not None:
             await self._close_from_runtime(close_reason)
             return None
+        if self._schedule_fast_tool_step is not None and item.stage_id == 0:
+            if self._ctx.plugin.has_fast_tool_steps(session.runtime_config):
+                await self.continue_fast_tool_steps(expected_epoch)
+            elif self._ctx.plugin.is_fast_tool_step_output(item.context.segment_output_metadata):
+                # A suppressed synthetic output has no listen/audio event to
+                # restart paced silence after the last internal token.
+                self._ctx.services.spawn(
+                    self.maybe_continue_response(expected_epoch=expected_epoch, expected_model_turn_id=session.turn_id),
+                    name="duplex-continue",
+                )
         finished = self._data_plane_outputs_finished(drain_result)
         # Intermediate-stage projection finishing means text is done, not the duplex turn.
         # Closing the stream here drops later Code2Wav chunks / next-turn bind.
@@ -1925,6 +1944,39 @@ class ModelChannel:
         )
         return stale_common_owner or stale_response_owner or stale_model_turn_owner
 
+    async def continue_fast_tool_steps(self, epoch: int) -> bool:
+        """Submit at most one internal step until Stage 0 acknowledges it."""
+        session = self._ctx.session
+        if self._schedule_fast_tool_step is None or session.epoch != epoch or self._ctx.run.closing:
+            return False
+        if not self._ctx.plugin.has_fast_tool_steps(session.runtime_config):
+            return False
+        if self._fast_tool_step_epoch == epoch:
+            return True
+        payload = self._ctx.plugin.fast_tool_step_payload(session.runtime_config)
+        if payload is None:
+            return False
+        self._fast_tool_step_epoch = epoch
+        scheduled = False
+        try:
+            scheduled = await self._schedule_fast_tool_step(payload, epoch)
+        finally:
+            if not scheduled:
+                self._fast_tool_step_epoch = None
+        return True
+
+    def release_unsubmitted_tool_step(self, epoch: int, *, retry: bool) -> None:
+        """A skipped append produces no output to release its synthetic slot."""
+        if self._fast_tool_step_epoch != epoch:
+            return
+        self._fast_tool_step_epoch = None
+        if retry and self._ctx.session.epoch == epoch and not self._ctx.run.closing:
+
+            async def resume() -> None:
+                await self.continue_fast_tool_steps(epoch)
+
+            self._ctx.services.spawn(resume(), name="duplex-tool-step")
+
     async def maybe_continue_response(
         self,
         *,
@@ -1948,6 +2000,8 @@ class ModelChannel:
             model_state.clear_continuation()
             return
         if expected_epoch is not None and session.epoch != expected_epoch:
+            return
+        if await self.continue_fast_tool_steps(session.epoch if expected_epoch is None else expected_epoch):
             return
         # Non-resumable stage0 cannot submit_update after the request finishes;
         # clear continuation and close the response (silent / listen final).

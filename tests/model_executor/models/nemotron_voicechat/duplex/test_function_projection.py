@@ -241,7 +241,13 @@ def test_intermediate_prefill_does_not_publish_or_consume_function_token(forced)
         else:
             assert int(token) == expected
             events = client_events(projector, "one", payload)
-            assert len(events) == 1 and events[0].get("function_call") is True
+            if forced is None:
+                assert len(events) == 1 and events[0].get("function_call") is True
+            else:
+                # The result's token happens to equal EOTC. It acknowledges
+                # an injection step without closing a model-generated call.
+                assert bool(payload["nvc_function_token_forced"])
+                assert events == []
         update = thinker.postprocess(hidden[:2], multimodal_outputs=envelope.multimodal_outputs, **info)
         if expected is None:
             assert update == {}

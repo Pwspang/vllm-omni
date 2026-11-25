@@ -279,6 +279,8 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
 
     omni_client_multimodal_output_keys = (
         "nvc_function_token",
+        "nvc_function_token_forced",
+        "nvc_tool_step",
         "nvc_function_response_consumed_generation",
     )
 
@@ -522,12 +524,19 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             # Acknowledge that ownership through the wire payload, not the
             # worker-local postprocess buffer. Lists preserve request alignment
             # even when a mixed prefill/decode batch has unequal token spans.
-            generations = [
-                int(self._sessions.get(info.get("request_id"), {}).get("function_response_generation", 0))
-                if isinstance(info, dict)
-                else 0
-                for info in info_dicts
+            sessions = [
+                self._sessions.get(info.get("request_id"), {}) if isinstance(info, dict) else {} for info in info_dicts
             ]
+            # Only duplex preprocessing owns this flag. Offline/turn-mode
+            # outputs retain their existing payload and allocate no markers.
+            if any("nvc_tool_step" in session for session in sessions):
+                multimodal_outputs["nvc_tool_step"] = [
+                    torch.tensor([session["nvc_tool_step"]], dtype=torch.bool)
+                    if "nvc_tool_step" in session
+                    else torch.empty(0, dtype=torch.bool)
+                    for session in sessions
+                ]
+            generations = [int(session.get("function_response_generation", 0)) for session in sessions]
             if any(generations):
                 multimodal_outputs["nvc_function_response_consumed_generation"] = [
                     torch.tensor([generation], dtype=torch.int64) for generation in generations
@@ -539,6 +548,12 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         # frame 0, so it publishes nothing and leaves a forced token queued.
         if self._use_function_head and model_outputs.numel() and isinstance(info_dicts, list) and info_dicts:
             function_tokens = self._client_function_tokens(model_outputs, info_dicts, kwargs.get("request_token_spans"))
+            forced = [
+                token is not None and isinstance(session.get("forced_function_token"), int)
+                for token, session in zip(function_tokens, sessions)
+            ]
+            if any(forced):
+                multimodal_outputs["nvc_function_token_forced"] = [torch.tensor([value]) for value in forced]
             if len(info_dicts) == 1:
                 if function_tokens[0] is not None:
                     multimodal_outputs["nvc_function_token"] = function_tokens[0]
@@ -619,7 +634,10 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         # All rows are validated before committing any request's policy state.
         sampled = logits.argmax(dim=-1).to(dtype=torch.int32)
         for row_idx, request_id, session, active, forced, pad_id in decisions:
-            if active or forced:
+            # Synthetic extraction also suppresses the EOTC frame: its text
+            # is not spoken, so feeding a sampled word back would silently
+            # consume the start of the reply before real audio resumes.
+            if active or forced or session.get("nvc_tool_step", False):
                 sampled[row_idx] = pad_id
             session["function_call_active"] = active
             # PAD must also reach the next frame's text fusion, not just the wire.
@@ -753,6 +771,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         """
         audio_groups: dict[int, list[_PerceptionFrame]] = defaultdict(list)
         seen: set[int] = set()
+        pending_updates = []
         for session, duplex in entries:
             if id(session) in seen:
                 raise ValueError("Nemotron VoiceChat perception batch contains a duplicate session")
@@ -763,11 +782,35 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 raise ValueError("Nemotron VoiceChat duplex input lacks source_input_seq") from exc
             if seq == session.get("last_input_seq"):
                 continue
+            if duplex.get("nvc_tool_step") is True:
+                last_seq = int(session.get("last_input_seq", 0))
+                if seq < last_seq:
+                    raise ValueError("Nemotron VoiceChat duplex input sequence moved backwards")
+                if seq != last_seq + 1:
+                    raise ValueError("Nemotron VoiceChat tool steps require contiguous input sequences")
+                # Synthetic appends advance the LLM clock only. Keep the
+                # acoustic window and Conformer caches untouched, and shift
+                # the sequence origin so the next real PCM frame consumes the
+                # next acoustic chunk rather than skipping mel columns.
+                pending_updates.append(
+                    (
+                        session,
+                        dict(
+                            # Consecutive tool steps can share their immutable
+                            # zero frame; real perception replaces it on resume.
+                            duplex_frame=session["duplex_frame"]
+                            if session.get("nvc_tool_step", False)
+                            else torch.zeros((1, self._hidden), dtype=self._dtype, device=device),
+                            duplex_seq_base=int(session.get("duplex_seq_base", 0)) + 1,
+                            last_input_seq=seq,
+                            nvc_tool_step=True,
+                        ),
+                    )
+                )
+                continue
             frame = self._prepare_perception_frame(session, duplex, device, seq)
             audio_groups[frame.audio.numel()].append(frame)
 
-        if not audio_groups:
-            return
         encoder = self.perception.encoder
         encoder_groups: dict[tuple[int, int], list[tuple[_PerceptionFrame, torch.Tensor]]] = defaultdict(list)
         for frames in audio_groups.values():
@@ -785,7 +828,6 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 )
                 encoder_groups[(mel.shape[-1], drop)].append((frame, mel))
 
-        pending_updates = []
         for (_, drop), group in encoder_groups.items():
             frames, chunks = zip(*group)
             # NeMo caches are [layers, batch, ...]; their valid lengths are [batch].
@@ -828,6 +870,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                             perception_cache_last_channel_len=channel_len[row : row + 1].clone(),
                             duplex_frame=stable[row].clone(),
                             last_input_seq=frame.source_input_seq,
+                            nvc_tool_step=False,
                         ),
                     )
                 )

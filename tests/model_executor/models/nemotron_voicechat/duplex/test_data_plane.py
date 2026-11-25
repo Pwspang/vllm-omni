@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.data_plane import (
@@ -33,7 +34,9 @@ def _projector(encode_audio=lambda *_: None) -> NemotronVoiceChatDataPlaneSessio
     return projector
 
 
-def _stage0_output(request_id: str = "req-0", *, text_token: int = 12, function_token: int | None = None) -> object:
+def _stage0_output(
+    request_id: str = "req-0", *, text_token: int = 12, function_token: int | None = None
+) -> SimpleNamespace:
     metadata: dict[str, object] = {"nvc_text_token_ids": [text_token]}
     if function_token is not None:
         metadata["nvc_function_token"] = [function_token]
@@ -94,3 +97,53 @@ def test_new_epoch_request_does_not_inherit_partial_function_or_frame_state() ->
     )
     audio_events = list(projector.project_output(audio))
     assert sum(event.get("end_of_turn") is True for event in audio_events) == 1
+
+
+@pytest.mark.parametrize("wrap", [lambda value: value, lambda value: [value], torch.tensor])
+@pytest.mark.parametrize("text_token", [0, 1, 12, 42])
+@pytest.mark.parametrize("metadata_text", [False, True])
+def test_synthetic_steps_preserve_call_without_advancing_frame_clock(text_token, metadata_text, wrap) -> None:
+    projector = _projector(lambda *_: "audio")
+    projector._decode = lambda token_ids: (
+        '[{"name":"weather","arguments":{"city":"Shanghai"}}]' if token_ids == [99] else "speech"
+    )
+    # A real acoustic frame opens the function channel; synthetic decoder
+    # appends supply its body and EOTC without adding listen/text/EOS events.
+    list(projector.project_output(_stage0_output(text_token=42, function_token=20)))
+    state = projector._requests["req-0"]
+    events = []
+    for function_token in (99, 21):
+        output = _stage0_output(text_token=text_token, function_token=function_token)
+        completion = output.request_output.outputs[0]
+        completion.multimodal_output["nvc_tool_step"] = wrap(True)
+        if not metadata_text:
+            completion.multimodal_output.pop("nvc_text_token_ids")
+            completion.token_ids = [text_token]
+        events.extend(projector.project_output(output))
+    assert len(events) == 1
+    assert events[0]["function_call"] is True
+    assert events[0]["name"] == "weather"
+    assert events[0]["arguments"] == '{"city":"Shanghai"}'
+    assert state.text_frames == 1
+    assert state.audio_frames == 0
+    assert state.pending_speech_end_frames == []
+    assert state.function_active is False
+
+    # Speech EOS still belongs to the next actual frame, and two decoded
+    # audio frames cover it even after multiple synthetic appends.
+    eos = _stage0_output(text_token=1)
+    eos.request_output.outputs[0].multimodal_output["nvc_tool_step"] = wrap(False)
+    assert list(projector.project_output(eos)) == []
+    assert state.text_frames == 2
+    audio = SimpleNamespace(
+        stage_id=2,
+        request_output=SimpleNamespace(
+            request_id="req-0",
+            outputs=[SimpleNamespace(multimodal_output={"audio": np.ones(3528, dtype=np.float32), "sr": 22050})],
+        ),
+    )
+    audio_events = list(projector.project_output(audio))
+    assert len(audio_events) == 1
+    assert audio_events[0]["end_of_turn"] is True
+    assert state.audio_frames == 2
+    assert state.pending_speech_end_frames == []

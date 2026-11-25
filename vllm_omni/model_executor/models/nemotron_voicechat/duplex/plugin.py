@@ -9,8 +9,10 @@ injection, per-session PCM state) both run engine-side, so one class owns them.
 
 Timeline contract (see ``nemotron_voicechat_thinker.py``): the Stage-0 prompt is
 ``[bos] + instructions + [eos]`` with the PAD text token fused over acoustic
-frame 0; every scheduler append afterwards carries exactly one 80 ms acoustic
-frame and decodes exactly one token. ``ignore_eos`` keeps the request alive;
+frame 0; every ordinary scheduler append afterwards carries exactly one 80 ms
+acoustic frame and decodes exactly one token. Tool-channel steps use consecutive
+scheduler appends with zero acoustic embeddings and no microphone frame.
+``ignore_eos`` keeps the request alive;
 the tokenizer's EOS *is* the model's "end of speech" signal, and the PAD token
 (``<SPECIAL_12>``) its "keep listening" signal.
 """
@@ -22,6 +24,7 @@ import json
 import os
 from collections.abc import Mapping
 from copy import deepcopy
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -73,6 +76,10 @@ _DEFAULT_SYSTEM_PROMPT = (
 #: Server-owned runtime_config keys a client must not override through extra_body.
 PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
     {
+        "nvc_tool_call_active",
+        "nvc_tool_call_steps",
+        "nvc_tool_result_steps",
+        "nvc_tool_step",
         "nvc_prompt_token_ids",
         "nvc_text_bos_id",
         "nvc_text_eos_id",
@@ -98,8 +105,23 @@ class NemotronVoiceChatClientRuntimeConfigError(DuplexRuntimeConfigError):
 
 #: Bound batches awaiting worker ownership so per-append runtime snapshots
 #: stay bounded. Once acknowledged, their tokens remain in the model-owned
-#: queue and drain at one forced token per 80 ms frame.
+#: queue and drain at one forced token per synthetic scheduler step.
 _MAX_PENDING_FUNCTION_RESPONSE_BATCHES = 8
+
+
+def _last_scalar(value: object) -> object:
+    # Output metadata can wrap a per-request tensor in a list.
+    while isinstance(value, (list, tuple)) and value:
+        value = value[-1]
+    return _last_scalar(value.tolist()) if hasattr(value, "tolist") else value
+
+
+class _ToolStepMarker(Enum):
+    # Enum identity survives runtime deep copies but cannot arrive over JSON.
+    TRUSTED = "tool_step"
+
+
+_MAX_FAST_TOOL_CALL_STEPS = 512
 
 
 def _stt_config(model_config: Any) -> dict[str, Any]:
@@ -264,6 +286,22 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
 
     # ---- engine policy (the frame-locked resumable Stage-0 request) ----
 
+    def has_fast_tool_steps(self, current: Mapping[str, object]) -> bool:
+        return bool(current.get("nvc_tool_call_steps", 0) or current.get("nvc_tool_result_steps", 0))
+
+    def is_fast_tool_step_output(self, metadata: Mapping[str, object]) -> bool:
+        return _last_scalar(metadata.get("nvc_tool_step")) is True and isinstance(
+            _last_scalar(metadata.get("nvc_function_token")), int
+        )
+
+    def fast_tool_step_payload(self, current: Mapping[str, object]) -> dict[str, object] | None:
+        if not self.has_fast_tool_steps(current):
+            return None
+        return {**self.silence_unit_payload(), "_nvc_tool_step": _ToolStepMarker.TRUSTED}
+
+    def is_fast_tool_step(self, payload: object) -> bool:
+        return isinstance(payload, dict) and payload.get("_nvc_tool_step") is _ToolStepMarker.TRUSTED
+
     def configure_sampling_params(
         self,
         *,
@@ -307,6 +345,7 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         del sampling_params
         decode_pcm_f32le(payload, exact_frame=True)
         normalized_payload = dict(payload)
+        normalized_payload.pop("_nvc_tool_step", None)
         prompt_ids = _plain_token_ids(
             runtime_config.get("nvc_prompt_token_ids"),
             name="nvc_prompt_token_ids",
@@ -315,13 +354,13 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
             runtime_config.get("nvc_max_model_len"),
             name="nvc_max_model_len",
         )
-        # ``seq`` is the per-epoch frame counter; the worker maps it 1:1 onto
-        # timeline positions of the resumable Stage-0 request.
+        # ``seq`` counts every scheduler append in this epoch, including
+        # internal tool steps. Every append consumes a position in Stage-0 KV.
         required_model_len = len(prompt_ids) + seq + 1
         if required_model_len > max_model_len:
             raise ValueError(
                 "Nemotron VoiceChat native duplex session exceeds the Stage-0 "
-                f"max_model_len: prompt_tokens={len(prompt_ids)} + input_frames={seq} + "
+                f"max_model_len: prompt_tokens={len(prompt_ids)} + scheduler_steps={seq} + "
                 f"sampled_token=1 gives {required_model_len} > {max_model_len}; "
                 "start a new session or raise Stage 0 max_model_len"
             )
@@ -341,7 +380,7 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
                 payload=normalized_payload,
                 final=final,
                 prompt_token_ids=scheduler_prompt,
-                model_fields={"source_input_seq": seq},
+                model_fields={"source_input_seq": seq, "nvc_tool_step": self.is_fast_tool_step(payload)},
             )
         )
 
@@ -487,7 +526,7 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         *,
         history_len: int | None = None,
     ) -> dict[str, object]:
-        """Queue a client tool result for frame-locked function-channel injection."""
+        """Queue a client tool result for consecutive function-channel scheduler steps."""
         del config, history_len
         call_id = item.get("call_id")
         output = item.get("output")
@@ -504,7 +543,7 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         return self._queue_function_response(current, output)
 
     def _queue_function_response(self, current: Mapping[str, object], output: str) -> dict[str, object]:
-        """Tokenize one function-channel response and queue it for a later frame."""
+        """Tokenize one function-channel response and queue its synthetic steps."""
         tokenizer_ref = current.get("nvc_tokenizer_ref")
         cached = self._tokenizers.get(str(tokenizer_ref)) if tokenizer_ref else None
         tokenizer = cached[1] if cached is not None else None
@@ -532,12 +571,13 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
             batches = []
         if len(batches) >= _MAX_PENDING_FUNCTION_RESPONSE_BATCHES:
             raise NemotronVoiceChatClientRuntimeConfigError(
-                "Nemotron VoiceChat received function results faster than the frame-locked "
+                "Nemotron VoiceChat received function results faster than the function "
                 f"channel drains them (>{_MAX_PENDING_FUNCTION_RESPONSE_BATCHES} pending batches); "
                 "return tool results after the model has consumed the previous one",
                 code="function_response_backlog",
             )
         batches = [*batches, {"generation": generation, "token_ids": token_ids}]
+        runtime["nvc_tool_result_steps"] = int(runtime.get("nvc_tool_result_steps", 0)) + len(token_ids)
         runtime["nvc_function_response_generation"] = generation
         runtime["nvc_function_response_batches"] = batches
         return runtime
@@ -555,13 +595,38 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         worker session cannot learn from its own state which generations the
         previous one already took.
         """
-        consumed = output_metadata.get("nvc_function_response_consumed_generation")
+        token = _last_scalar(output_metadata.get("nvc_function_token"))
+        consumed = _last_scalar(output_metadata.get("nvc_function_response_consumed_generation"))
+        fast_output = self.is_fast_tool_step_output(output_metadata)
+        result_owned = isinstance(token, int) and _last_scalar(output_metadata.get("nvc_function_token_forced")) is True
+        changed = isinstance(token, int) and (
+            fast_output
+            or result_owned
+            or token == current.get("nvc_function_sotc_id")
+            or token == current.get("nvc_function_eotc_id")
+        )
+        if not changed and not consumed:
+            return None
+        runtime = dict(current)
+        if changed:
+            call_steps = max(0, int(runtime.get("nvc_tool_call_steps", 0)) - int(fast_output))
+            # Forced response contents are data, including boundary-valued
+            # tokens. A real step can also take ownership of a queued result.
+            if not result_owned:
+                if token == runtime.get("nvc_function_eotc_id"):
+                    runtime["nvc_tool_call_active"] = False
+                    call_steps = 0
+                elif token == runtime.get("nvc_function_sotc_id") and not runtime.get("nvc_tool_call_active", False):
+                    runtime["nvc_tool_call_active"] = True
+                    call_steps = _MAX_FAST_TOOL_CALL_STEPS
+            runtime["nvc_tool_call_steps"] = call_steps
+            runtime["nvc_tool_result_steps"] = max(0, int(runtime.get("nvc_tool_result_steps", 0)) - int(result_owned))
         try:
             consumed_generation = int(consumed)
         except (TypeError, ValueError):
-            return None
+            return runtime if changed else None
         if consumed_generation <= 0:
-            return None
+            return runtime if changed else None
         batches = current.get("nvc_function_response_batches")
         remaining: list[object] | None = None
         if isinstance(batches, list):
@@ -572,8 +637,7 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
             ]
         floor = self._function_response_floor(current)
         if consumed_generation <= floor and (remaining is None or len(remaining) == len(batches)):
-            return None
-        runtime = deepcopy(dict(current))
+            return runtime if changed else None
         runtime["nvc_function_response_floor_generation"] = max(floor, consumed_generation)
         if remaining is not None:
             runtime["nvc_function_response_batches"] = remaining
@@ -632,11 +696,15 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         floor = self._function_response_floor(current)
         batches = current.get("nvc_function_response_batches")
         has_batches = isinstance(batches, list) and bool(batches)
-        if not has_batches and generation <= floor:
+        has_fast_work = bool(current.get("nvc_tool_call_active") or current.get("nvc_tool_result_steps"))
+        if not has_batches and generation <= floor and not has_fast_work:
             # Nothing is queued and the floor already names the newest
             # generation: the runtime already holds what this would write.
             return None
         runtime = deepcopy(dict(current))
+        runtime["nvc_tool_call_active"] = False
+        runtime["nvc_tool_call_steps"] = 0
+        runtime["nvc_tool_result_steps"] = 0
         runtime["nvc_function_response_batches"] = []
         runtime["nvc_function_response_floor_generation"] = max(floor, generation)
         return runtime

@@ -98,9 +98,27 @@ async def test_fresh_response_completes_after_abandoned_tool(monkeypatch, interr
     async with open_timed_harness(monkeypatch) as h:
         call_id = await prepare(h)
         if interruption == "timeout":
+            submissions_before = len(h.port.submissions)
+            request = h.runner.plugin.data_plane._requests[h.stage0_request_id()]
+            media_clock_before = (request.text_frames, request.audio_frames)
             h.clock.advance(5.0)
             h.scheduler.fire_all()
             assert error_codes(await h.settle()) == ["tool_result_timeout"]
+            # Timeout produces a server-owned result notice. It must progress
+            # with the microphone paused, then acknowledge the forced token
+            # before this fixture supplies the next ordinary speech frame.
+            assert len(h.port.submissions) == submissions_before + 1
+            notice = batches(h)[0]
+            for token in notice["token_ids"]:
+                await deliver(
+                    h,
+                    nvc_function_token=[token],
+                    nvc_function_token_forced=True,
+                    nvc_function_response_consumed_generation=notice["generation"],
+                )
+            assert batches(h) == []
+            assert not h.runner.plugin.has_fast_tool_steps(h.session.runtime_config)
+            assert (request.text_frames, request.audio_frames) == media_clock_before
         else:
             await h.run(commands.CancelInput())
         assert error_codes(await answer(h, call_id)) == ["invalid_function_call_output"]

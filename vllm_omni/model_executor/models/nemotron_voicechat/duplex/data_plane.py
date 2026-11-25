@@ -19,6 +19,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
+from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import scalar_bool
 from vllm_omni.outputs.duplex import (
     get_duplex_output_decision,
 )
@@ -247,8 +248,11 @@ class NemotronVoiceChatDataPlaneSession(DuplexDataPlane):
         wants_audio = "audio" in modalities
         if stage_id == 0 or "nvc_text_token_ids" in metadata:
             ids = self._ids()
-            text_ids = _coerce_ints(metadata.get("nvc_text_token_ids"))
-            if not text_ids and completion is not None:
+            tool_step = scalar_bool(metadata.get("nvc_tool_step"))
+            # Synthetic decoder steps still carry the function token (notably
+            # EOTC), but their sampled text/PAD is not an 80 ms audio frame.
+            text_ids = [] if tool_step else _coerce_ints(metadata.get("nvc_text_token_ids"))
+            if not tool_step and not text_ids and completion is not None:
                 text_ids = _coerce_ints(
                     getattr(completion, "token_ids", None) or getattr(completion, "cumulative_token_ids", None)
                 )
@@ -279,6 +283,10 @@ class NemotronVoiceChatDataPlaneSession(DuplexDataPlane):
                             "end_of_turn": False,
                         }
 
+            # An injected result can itself contain a reserved function ID.
+            # Only model-generated tokens participate in call extraction.
+            if scalar_bool(metadata.get("nvc_function_token_forced")):
+                return
             for function_id in _coerce_ints(metadata.get("nvc_function_token"))[-1:]:
                 yield from self._project_function_token(
                     function_id,

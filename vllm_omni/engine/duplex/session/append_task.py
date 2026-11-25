@@ -189,6 +189,16 @@ class AppendAttempt:
             self.abandon(reason="input_cleared")
             # Called off, not failed: audio appended after the clear still runs.
             return True
+        if self.ctx.plugin.has_fast_tool_steps(
+            self.ctx.session.runtime_config
+        ) and not self.ctx.plugin.is_fast_tool_step(self.payload):
+            # A tool may open while microphone input waits in the append chain.
+            # Consume its reservation without forwarding or replaying its PCM.
+            if self.pcm_reservation is not None and self.pcm_reservation.active:
+                self.pcm_reservation.commit()
+                self.ctx.session.release_input_bytes(self.pcm_reservation.byte_count)
+            self.abandon(reason="tool_step_input_discarded")
+            return True
         return await self._submit()
 
     async def _submit(self) -> bool:
@@ -225,6 +235,11 @@ class AppendAttempt:
                 self.discard_retained_audio()
             else:
                 self.abandon()
+                if self.ctx.plugin.is_fast_tool_step(self.payload):
+                    # Internal work has no later client append to recover a
+                    # failed chain. In particular, a context limit must not
+                    # leave the microphone permanently discarded.
+                    self.fail_session("runtime_append_failed")
             if not append_ok and session.state == DuplexSessionState.CLOSED:
                 self.ctx.run.runtime_closed = True
                 return False

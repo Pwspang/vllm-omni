@@ -419,3 +419,117 @@ def test_failed_prompt_fusion_preserves_prompt_for_retry(thinker, monkeypatch, b
     assert "prompt_ids" not in session
     assert session["duplex_frame"] is frame
     assert session["last_input_seq"] == 1
+
+
+def tool_append(seq):
+    packet = append(0, seq)
+    packet["nvc_tool_step"] = True
+    # Tool steps must not decode PCM or run any perception operators.
+    packet.pop("payload")
+    return packet
+
+
+@pytest.mark.parametrize("initial_frames", [1, 40])
+def test_tool_steps_skip_perception_and_resume_acoustic_clock(thinker, monkeypatch, initial_frames):
+    state: dict[str, Any] = {}
+    reference: dict[str, Any] = {}
+    thinker._duplex_stable_frames([(state, append(0, 1))], DEVICE)
+    serial_reference(thinker, reference, 0, 1)
+    for seq in range(2, initial_frames + 1):
+        thinker._duplex_stable_frames([(state, append(0, seq))], DEVICE)
+        serial_reference(thinker, reference, 0, seq)
+    before = {key: state[key] for key in (*CACHE_KEYS, "duplex_audio")}
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("tool step ran perception")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(thinker._streaming_preprocessor, "forward", forbidden)
+        patch.setattr(thinker.perception.encoder, "cache_aware_stream_step", forbidden)
+        patch.setattr(thinker.perception.modality_adapter, "forward", forbidden)
+        patch.setattr(thinker.perception.proj, "forward", forbidden)
+        zero_frame = None
+        for seq in range(initial_frames + 1, initial_frames + 8):
+            packet = tool_append(seq)
+            thinker._duplex_stable_frames([(state, packet)], DEVICE)
+            frame = state["duplex_frame"]
+            if zero_frame is None:
+                zero_frame = frame
+            assert frame is zero_frame
+            thinker._duplex_stable_frames([(state, packet)], DEVICE)
+            assert state["duplex_frame"] is frame
+            assert torch.count_nonzero(frame) == 0
+            assert state["last_input_seq"] == seq
+            assert state["duplex_seq_base"] == seq - initial_frames
+            assert state["nvc_tool_step"] is True
+            for key, value in before.items():
+                assert state[key] is value
+    packet = append(0, initial_frames + 1)
+    packet["source_input_seq"] = initial_frames + 8
+    thinker._duplex_stable_frames([(state, packet)], DEVICE)
+    torch.testing.assert_close(state["duplex_frame"], serial_reference(thinker, reference, 0, initial_frames + 1))
+    for key, expected in zip(CACHE_KEYS, reference["caches"]):
+        torch.testing.assert_close(state[key], expected)
+    assert state["nvc_tool_step"] is False
+
+
+def test_mixed_tool_and_audio_failure_is_atomic_and_retryable(thinker, monkeypatch):
+    sessions: list[dict[str, Any]] = [{}, {}]
+    thinker._duplex_stable_frames([(state, append(row, 1)) for row, state in enumerate(sessions)], DEVICE)
+    entries = [(sessions[0], tool_append(2)), (sessions[1], append(1, 2))]
+    before = [dict(state) for state in sessions]
+
+    def fail(**kwargs):
+        raise RuntimeError("injected perception failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(thinker.perception.encoder, "cache_aware_stream_step", fail)
+        with pytest.raises(RuntimeError, match="injected perception"):
+            thinker._duplex_stable_frames(entries, DEVICE)
+    assert sessions == before
+    thinker._duplex_stable_frames(list(reversed(entries)), DEVICE)
+    assert [state["last_input_seq"] for state in sessions] == [2, 2]
+    assert [state["nvc_tool_step"] for state in sessions] == [True, False]
+    assert torch.count_nonzero(sessions[0]["duplex_frame"]) == 0
+    assert torch.count_nonzero(sessions[1]["duplex_frame"]) > 0
+
+
+@pytest.mark.parametrize("seq,match", [(0, "backwards"), (3, "contiguous")])
+def test_invalid_tool_sequence_preserves_acoustic_state(thinker, seq, match):
+    state: dict[str, Any] = {}
+    thinker._duplex_stable_frames([(state, append(0, 1))], DEVICE)
+    before = dict(state)
+    with pytest.raises(ValueError, match=match):
+        thinker._duplex_stable_frames([(state, tool_append(seq))], DEVICE)
+    assert state == before
+
+
+def test_chunked_prefill_then_tool_step_fuses_feedback_with_zero_audio(thinker):
+    packet = append(0, 1)
+    for offset, span in [(0, 1), (1, 2)]:
+        thinker._preprocess_duplex(
+            request_id="a",
+            input_ids=torch.zeros(span, dtype=torch.long),
+            info={"_omni_num_computed_tokens": offset},
+            duplex=packet,
+        )
+    session = thinker._sessions["a"]
+    thinker._duplex_previous_text_tokens["a"] = 0
+    packet = tool_append(2)
+    packet["runtime_config"].update(
+        nvc_function_response_generation=1,
+        nvc_function_response_batches=[{"generation": 1, "token_ids": [3, 4]}],
+    )
+    for _ in range(2):
+        _, embeds, _ = thinker._preprocess_duplex(
+            request_id="a",
+            input_ids=torch.zeros(1, dtype=torch.long),
+            info={"_omni_num_computed_tokens": 3, "nvc_prev_function_token": 5},
+            duplex=packet,
+        )
+        expected = thinker.embed_tokens(torch.tensor([0])) + thinker.embed_tokens(torch.tensor([5]))
+        torch.testing.assert_close(embeds, expected)
+        assert session["forced_function_tokens"] == [3, 4]
+        assert session["forced_function_token"] == 3
+        assert session["sampling_frame_eligible"] is True
+        assert thinker._sessions["a"] is session

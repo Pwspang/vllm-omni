@@ -10,13 +10,19 @@ import torch
 
 
 def scalar_bool(value: object) -> bool:
-    """Normalize a Python or tensor scalar to bool.
+    """Normalize a Python or tensor scalar, optionally in a singleton container, to bool.
 
     Inter-stage scalar metadata is tensorized while it rides the engine output
     channel, so model consumers must not rely on object identity with ``True``.
     Empty tensors mean "unset"; non-scalar tensors are rejected instead of
     silently choosing an element.
     """
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return False
+        if len(value) != 1:
+            raise ValueError(f"Expected scalar boolean metadata, got sequence of length {len(value)}.")
+        value = value[0]
     if isinstance(value, torch.Tensor):
         if value.numel() == 0:
             return False

@@ -424,3 +424,128 @@ def test_mrv2_turn_mode_keeps_native_sampler_registration():
     state.model = model
     assert state.custom_sampler(object()) is None
     assert not getattr(model, "_mrv2_duplex_sampling", False)
+
+
+@pytest.mark.parametrize("tool_first", [True, False])
+def test_tool_step_marker_is_request_aligned_and_clears_on_real_audio(tool_first):
+    model = sampler_shell()
+    model._sessions["one"]["nvc_tool_step"] = tool_first
+    model._sessions["two"]["nvc_tool_step"] = not tool_first
+    hidden = torch.zeros(3, 32)
+    output = model.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[{"request_id": "two"}, {"request_id": "one"}],
+        request_token_spans=[(0, 2), (2, 3)],
+    )
+    assert [bool(value.item()) for value in output.multimodal_outputs["nvc_tool_step"]] == [not tool_first, tool_first]
+    assert "nvc_tool_step" in model.omni_client_multimodal_output_keys
+    model._sessions["one"]["nvc_tool_step"] = False
+    output = model.make_omni_output(hidden[:1], model_intermediate_buffer=[{"request_id": "one"}])
+    assert output.multimodal_outputs["nvc_tool_step"][0].item() is False
+
+
+def test_tool_step_function_boundaries_preserve_text_and_forced_feedback_policy():
+    model = sampler_shell()
+    model._sessions["one"]["nvc_tool_step"] = True
+    text, functions = sample_frame(model, [SOTC])
+    assert text == [PAD] and functions == [SOTC]
+    text, functions = sample_frame(model, [7])
+    assert text == [PAD] and functions == [7]
+    text, functions = sample_frame(model, [EOTC])
+    assert text == [PAD] and functions == [EOTC]
+    assert model._duplex_previous_text_tokens["one"] == PAD
+    assert model._sessions["one"]["function_call_active"] is False
+    model._sync_forced_function_response(
+        model._sessions["one"],
+        {
+            "nvc_function_response_generation": 1,
+            "nvc_function_response_batches": [{"generation": 1, "token_ids": [30]}],
+        },
+    )
+    text, functions = sample_frame(model, [SOTC])
+    assert text == [PAD] and functions == [30]
+    assert model._sessions["one"]["function_call_active"] is False
+    model._sessions["one"]["nvc_tool_step"] = False
+    text, functions = sample_frame(model, [7])
+    assert text == [TEXT] and functions == [7]
+
+
+def test_real_function_end_releases_text_while_batched_tool_end_keeps_pad_feedback():
+    model = sampler_shell()
+    for session in model._sessions.values():
+        session["function_call_active"] = True
+    model._sessions["one"]["nvc_tool_step"] = True
+    model._sessions["two"]["nvc_tool_step"] = False
+    text, functions = sample_frame(model, [EOTC, EOTC], ("two", "one"))
+    assert text == [TEXT, PAD]
+    assert functions == [EOTC, EOTC]
+    assert model._duplex_previous_text_tokens == {"two": TEXT, "one": PAD}
+    assert all(not session["function_call_active"] for session in model._sessions.values())
+
+
+def test_synthetic_boundary_sampler_commits_pad_feedback_before_real_resumption():
+    model = sampler_shell()
+    model._mrv2_duplex_sampling = True
+    session = model._sessions["one"]
+    session.update(nvc_tool_step=True, function_call_active=True)
+    hidden = torch.nn.functional.one_hot(torch.tensor([EOTC]), num_classes=32).to(torch.float32)
+    wire = model.make_omni_output(hidden, model_intermediate_buffer=[{"request_id": "one"}])
+    logits = model.compute_logits(hidden)
+    rows = (DuplexSamplingRow(0, "one", session_id=None, seq=None, payload=None, max_tokens=None),)
+    model.prepare_duplex_sampling(logits, None, rows)
+    sampled = model.sample(logits, None)
+    assert sampled.sampled_token_ids.tolist() == [[PAD]]
+    assert int(wire.multimodal_outputs["nvc_function_token"]) == EOTC
+    assert bool(wire.multimodal_outputs["nvc_tool_step"][0]) is True
+    assert session["func_token"] == EOTC
+    assert session["function_call_active"] is False
+    assert model._duplex_previous_text_tokens["one"] == PAD
+    session["nvc_tool_step"] = False
+    logits = model.compute_logits(hidden)
+    model.prepare_duplex_sampling(logits, None, rows)
+    sampled = model.sample(logits, None)
+    assert sampled.sampled_token_ids.tolist() == [[TEXT]]
+    assert model._duplex_previous_text_tokens["one"] == TEXT
+
+
+@pytest.mark.parametrize("use_function_head", [False, True])
+@pytest.mark.parametrize("requests", [("one",), ("two", "one")])
+def test_offline_output_omits_tool_step_marker_without_allocating_it(monkeypatch, use_function_head, requests):
+    model = sampler_shell(use_function_head=use_function_head)
+    # Offline sessions have no flag set by duplex acoustic preprocessing.
+    assert all("nvc_tool_step" not in session for session in model._sessions.values())
+    hidden = torch.nn.functional.one_hot(torch.tensor([7] * len(requests)), num_classes=32).to(torch.float32)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("offline output allocated a tool-step marker")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "tensor", forbidden)
+        patch.setattr(torch, "empty", forbidden)
+        output = model.make_omni_output(
+            hidden,
+            model_intermediate_buffer=[{"request_id": name} for name in requests],
+            request_token_spans=[(index, index + 1) for index in range(len(requests))],
+        )
+    assert output.text_hidden_states is hidden
+    if use_function_head:
+        assert set(output.multimodal_outputs) == {"nvc_function_token"}
+        tokens = output.multimodal_outputs["nvc_function_token"]
+        if isinstance(tokens, list):
+            tokens = torch.cat(tokens)
+        assert tokens.tolist() == [7] * len(requests)
+    else:
+        assert output.multimodal_outputs == {}
+
+
+def test_tool_step_marker_keeps_empty_slot_for_offline_row():
+    model = sampler_shell()
+    model._sessions["one"]["nvc_tool_step"] = False
+    output = model.make_omni_output(
+        torch.zeros(2, 32),
+        model_intermediate_buffer=[{"request_id": "two"}, {"request_id": "one"}],
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+    offline, real_duplex = output.multimodal_outputs["nvc_tool_step"]
+    assert offline.numel() == 0
+    assert real_duplex.tolist() == [False]

@@ -140,6 +140,7 @@ def thinker2talker_async_chunk(
     multimodal_output: Any = None,
     request: Any = None,
     is_finished: bool = False,
+    new_token_ids: Any = _STEP_TOKEN_SNAPSHOT_MISSING,
     **kwargs: Any,
 ) -> OmniPayloadStruct | None:
     """Streaming producer: ship the CUMULATIVE text timeline each thinker step.
@@ -152,13 +153,18 @@ def thinker2talker_async_chunk(
     the payload self-contained. ``meta.num_processed_tokens`` carries the
     logical prompt length for the code2wav producer's prompt-region trim.
     """
-    step_snapshot = kwargs.pop("new_token_ids", _STEP_TOKEN_SNAPSHOT_MISSING)
+    step_snapshot = new_token_ids
     has_step_snapshot = step_snapshot is not _STEP_TOKEN_SNAPSHOT_MISSING
     generated_delta = [int(token_id) for token_id in ((step_snapshot or ()) if has_step_snapshot else ())]
     request_id = request.external_req_id
     request_info = _request_info(request)
     duplex_info = request_info.get("duplex") if isinstance(request_info, dict) else None
     is_duplex = isinstance(duplex_info, dict) and duplex_info.get("data_plane") is True
+    if is_duplex and isinstance(duplex_info, dict) and scalar_bool(duplex_info.get("nvc_tool_step")):
+        # A synthetic decoder-only append advances the function channel, not
+        # the acoustic clock. Do not drain even a pending native-talker drip
+        # here: no timeline/codec work belongs to this input step.
+        return None
 
     state = transfer_manager.request_payload.get(request_id)
     generated_now = [int(token_id) for token_id in (getattr(request, "output_token_ids", None) or [])]

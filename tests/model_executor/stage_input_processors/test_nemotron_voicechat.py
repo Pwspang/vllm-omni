@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -131,13 +132,20 @@ def test_validate_code_stack_negatives() -> None:
         validate_code_stack(bad, 31, 1024)
 
 
-def test_scalar_bool_normalizes_tensor_metadata() -> None:
+@pytest.mark.parametrize("wrap", [lambda value: value, lambda value: [value], lambda value: (value,), torch.tensor])
+def test_scalar_bool_normalizes_tensor_metadata(wrap) -> None:
     from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import scalar_bool
 
-    assert scalar_bool(True)
+    assert scalar_bool(wrap(True))
+    assert not scalar_bool(wrap(False))
     assert scalar_bool(torch.tensor(True))
     assert scalar_bool(torch.tensor([True]))
     assert not scalar_bool(torch.empty(0, dtype=torch.bool))
+    assert not scalar_bool([])
+    assert not scalar_bool(())
+    for value in ([True, False], (True, False)):
+        with pytest.raises(ValueError, match="scalar boolean metadata"):
+            scalar_bool(value)
     with pytest.raises(ValueError, match="scalar boolean metadata"):
         scalar_bool(torch.tensor([True, False]))
 
@@ -240,7 +248,7 @@ def test_sanitize_tts_model_cfg_disables_pretrained_loads(monkeypatch) -> None:
         sanitize_tts_model_cfg,
     )
 
-    original = {
+    original: dict[str, Any] = {
         "pretrained_lm_name": "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
         "pretrained_codec_model": "/some/external/codec.ckpt",
         "tts_config": {
@@ -323,6 +331,116 @@ def test_thinker2talker_async_chunk_cumulative_timeline() -> None:
     payload = thinker2talker_async_chunk(tm, {}, req, is_finished=True)
     assert payload.ids.all == [_PAD] * 3 + [7, 8, 9]
     assert bool(payload.meta.finished)
+
+
+@pytest.mark.parametrize("wrap", [lambda value: value, lambda value: [value], torch.tensor])
+@pytest.mark.parametrize("native_talker", [False, True])
+@pytest.mark.parametrize("segment_finished", [False, True])
+def test_duplex_tool_steps_do_not_extend_or_drain_talker_timeline(native_talker, segment_finished, wrap) -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import thinker2talker_async_chunk
+
+    tm = _fake_transfer_manager()
+    tm.connector.config["extra"]["native_talker"] = native_talker
+    req = _streaming_request(3, [7], {"duplex": {"data_plane": True}})
+    first = thinker2talker_async_chunk(tm, {}, req, new_token_ids=(7,))
+    assert first.ids.all == [_PAD, 7]
+    saved_state = dict(tm.request_payload[req.external_req_id])
+
+    req.additional_information["duplex"]["nvc_tool_step"] = wrap(True)
+    # The segment ledger may contain old acoustic and synthetic tokens. Only
+    # the matching input and sampled-token snapshot describe this step.
+    req.output_token_ids = [7, _PAD, _PAD]
+    for _ in range(2):
+        assert thinker2talker_async_chunk(tm, {}, req, is_finished=segment_finished, new_token_ids=(_PAD,)) is None
+        assert tm.request_payload[req.external_req_id] == saved_state
+
+    req.additional_information["duplex"]["nvc_tool_step"] = wrap(False)
+    req.output_token_ids.append(8)
+    resumed = thinker2talker_async_chunk(tm, {}, req, new_token_ids=(8,))
+    assert resumed.ids.all == [_PAD, 7, 8]
+    assert resumed.meta.next_stage_prompt_len == 1
+    assert not bool(resumed.meta.finished)
+
+
+@pytest.mark.parametrize("tool_step", [False, True])
+def test_duplex_transfer_uses_admitted_input_snapshot(tool_step) -> None:
+    from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import thinker2talker_async_chunk
+
+    req = _streaming_request(3, [7], {"duplex": {"data_plane": True, "nvc_tool_step": tool_step}})
+    admitted = OmniChunkTransferAdapter._snapshot_processor_request(req)
+    # Simulate the live request admitting the next append before the save
+    # thread processes this one. Both transitions must retain their identity.
+    req.additional_information["duplex"]["nvc_tool_step"] = not tool_step
+    tm = _fake_transfer_manager()
+    payload = thinker2talker_async_chunk(tm, {}, admitted, new_token_ids=(7,))
+    if tool_step:
+        assert payload is None
+        assert tm.request_payload == {}
+    else:
+        assert payload.ids.all == [_PAD, 7]
+
+
+def test_duplex_native_transport_passes_only_the_matching_steps_tokens() -> None:
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import thinker2talker_async_chunk
+
+    transport = object.__new__(_OmniConnectorPayloadTransportMixin)
+    transport._custom_process_func = thinker2talker_async_chunk
+    transport._omni_connector = None
+    transport.request_payload = {}
+    req = _streaming_request(3, [7], {"duplex": {"data_plane": True}})
+    req.is_segment_finished = True
+    req.sampled_token_ids = [7]
+    first = transport._build_custom_process_payload(req.external_req_id, req, {}, propagate_errors=True)
+    assert first.ids.all == [_PAD, 7]
+    # A retained segment ledger can contain earlier synthetic tokens; the
+    # native adapter must forward only this real frame's sampled snapshot.
+    req.output_token_ids = [7, _PAD, _PAD, 8]
+    req.sampled_token_ids = [8]
+    second = transport._build_custom_process_payload(req.external_req_id, req, {}, propagate_errors=True)
+    assert second.ids.all == [_PAD, 7, 8]
+
+
+@pytest.mark.parametrize("request_finished", [False, True])
+def test_synthetic_step_preserves_transport_boundary_without_codec_work(request_finished) -> None:
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import thinker2talker_async_chunk
+    from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
+
+    tm = _fake_transfer_manager()
+    req = _streaming_request(3, [_PAD], {"duplex": {"data_plane": True, "nvc_tool_step": True}})
+    req.is_finished = lambda: request_finished
+    req.is_segment_finished = not request_finished
+    payload = thinker2talker_async_chunk(tm, {}, req, is_finished=True, new_token_ids=(_PAD,))
+    assert payload is None
+    # The generic transport still owns request/segment closure. Its marker
+    # contains no new timeline, prompt horizon, or codec row to execute.
+    transport = object.__new__(_OmniConnectorPayloadTransportMixin)
+    marker = transport._annotate_resumable_chunk(req, payload)
+    assert marker == {"meta": {"finished": request_finished, "is_segment_finished": not request_finished}}
+    assert not _OmniConnectorPayloadTransportMixin._payload_is_consumable(marker)
+    assert DefaultSchedulingMetadataAdapter().extract(marker, model_mode="ar") is None
+    assert tm.request_payload == {}
+
+
+def test_synthetic_step_does_not_drain_pending_native_talker_tokens() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import thinker2talker_async_chunk
+
+    tm = _fake_transfer_manager()
+    tm.connector.config["extra"]["native_talker"] = True
+    req = _streaming_request(3, [7, 8], {"duplex": {"data_plane": True}})
+    assert thinker2talker_async_chunk(tm, {}, req, new_token_ids=(7, 8)).ids.all == [_PAD, 7]
+    saved_state = dict(tm.request_payload[req.external_req_id])
+    req.additional_information["duplex"]["nvc_tool_step"] = True
+    assert thinker2talker_async_chunk(tm, {}, req, new_token_ids=(_PAD,)) is None
+    assert tm.request_payload[req.external_req_id] == saved_state
+    req.additional_information["duplex"]["nvc_tool_step"] = False
+    assert thinker2talker_async_chunk(tm, {}, req, new_token_ids=(9,)).ids.all == [_PAD, 7, 8]
 
 
 def test_talker2code2wav_async_chunk_cadence_and_left_context() -> None:

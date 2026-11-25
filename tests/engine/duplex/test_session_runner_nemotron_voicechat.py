@@ -4,7 +4,7 @@
 """Essential Nemotron regressions through the real session runner and plugin.
 
 The second half drives the tool-call lifecycle the way a client does: the
-model's frame-locked function channel exposes a call, the client answers it with
+model's function channel exposes a call, the client answers it with
 a ``function_call_output`` conversation item, and the session's ledger decides
 whether that answer is admissible. Scheduling is not waited for -- the harness
 injects the ledger's own clock and its ``call_later`` seam, so every ordering
@@ -156,6 +156,11 @@ async def harness(monkeypatch):
 
 
 async def deliver(h, token_id=12, **metadata):
+    # Mirror the worker marker on the output of the latest submitted step.
+    # Function-channel fixtures now advance through synthetic scheduler steps.
+    if h.port.submissions:
+        duplex = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        metadata.setdefault("nvc_tool_step", duplex.get("nvc_tool_step", False))
     output = SimpleNamespace(
         request_id=h.stage0_request_id(),
         finished=False,
@@ -265,7 +270,7 @@ def output_item(call_id: str, output: str = "20", **extra: object) -> dict[str, 
 
 
 async def expose_function_call(h: Harness, *, tokens: tuple[int, ...] = (20, 7, 21)):
-    """Emit one frame-locked function call; return its call id and the events.
+    """Emit one function-channel call; return its call id and the events.
 
     The ids come from the projected ``response.function_call_arguments.done``,
     which is exactly what a client would answer -- so the assertions below are
@@ -900,7 +905,8 @@ async def test_a_result_that_misses_its_deadline_while_the_plugin_renders_it_is_
 
         # Building the candidate is synchronous but not free: tokenizing a tool
         # result is work, and the fake clock crosses the deadline inside it. The
-        # candidate must not be installed and no continuation may be spawned.
+        # candidate must not be installed; only the server's timeout notice
+        # may schedule its own internal continuation.
         def encode_and_cross_the_deadline(text, **kwargs):
             tokens = real_encode(text, **kwargs)
             h.clock.advance(TIMEOUT_S)
@@ -913,11 +919,14 @@ async def test_a_result_that_misses_its_deadline_while_the_plugin_renders_it_is_
         assert error_codes(refused) == ["invalid_function_call_output", "tool_result_timeout"]
         assert errors(refused)[0].param == "item.call_id"
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.TIMED_OUT
-        # The result was not committed: no item for the client, no continuation
-        # into the next stage frame, and the only batch is the session's notice.
+        # The late result was not committed. The only continuation carries
+        # the session's timeout notice and can progress without microphone input.
         assert "conversation.item.created" not in types(refused)
         assert generation(h) == 1 and len(batches(h)) == 1
-        assert len(h.port.submissions) == submissions_before
+        assert len(h.port.submissions) == submissions_before + 1
+        duplex = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert duplex["nvc_tool_step"] is True
+        assert duplex["runtime_config"]["nvc_function_response_batches"] == batches(h)
 
 
 @pytest.mark.asyncio

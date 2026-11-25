@@ -1,8 +1,9 @@
 # Nemotron VoiceChat native Full-Duplex deployment.
 #
-# One scheduler segment consumes one 1280-sample (80 ms) microphone frame.
-# Stage 0 remains one resumable request, so its NemotronH KV/Mamba state is
-# preserved between frame appends. Stage 1 and the codec overlap per frame.
+# Speech uses one scheduler segment per 1280-sample (80 ms) microphone frame.
+# Tool-call extraction and result injection use the same resumable Stage 0
+# request with a zero audio embedding and can advance between microphone frames.
+# Only acoustic steps extend the talker timeline.
 #
 # The default is the FAST profile (TTFP 712 ms -> 408 ms and realtime audio
 # delivery — one 80 ms packet per frame, median inter-chunk gap ~81 ms,

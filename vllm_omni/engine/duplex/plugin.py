@@ -626,6 +626,22 @@ class DuplexModelPlugin(ABC):
         """
         return payload, None
 
+    def has_fast_tool_steps(self, current: Mapping[str, object]) -> bool:
+        """Whether microphone input should be discarded for internal tool work."""
+        return False
+
+    def is_fast_tool_step_output(self, metadata: Mapping[str, object]) -> bool:
+        """Whether a completed model step acknowledges an internal append."""
+        return False
+
+    def fast_tool_step_payload(self, current: Mapping[str, object]) -> dict[str, object] | None:
+        """Return a trusted synthetic append while model-owned tool work remains."""
+        return None
+
+    def is_fast_tool_step(self, payload: object) -> bool:
+        """Recognize an internal step; client-provided flags cannot opt in."""
+        return False
+
     def silence_unit_payload(self) -> dict[str, object]:
         """One silence unit as an append payload (``pcm_f32le`` zeros).
 

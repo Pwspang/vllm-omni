@@ -405,17 +405,25 @@ def test_delta_drains_nemotron_per_frame_function_fields():
     """Each DELTA completion carries one frame's function token and no stale acknowledgement."""
     s = _make_state(RequestOutputKind.DELTA)
     s.add_multimodal_tensor(
-        {"nvc_function_token": torch.tensor([20]), "nvc_function_response_consumed_generation": torch.tensor([3])},
+        {
+            "nvc_function_token": torch.tensor([20]),
+            "nvc_function_response_consumed_generation": torch.tensor([3]),
+            "nvc_tool_step": torch.tensor([True]),
+            "nvc_function_token_forced": torch.tensor([True]),
+        },
         mm_type=LATENT,
     )
     first = s._new_completion_output([1], None, None).multimodal_output
     assert first["nvc_function_token"].tolist() == [20]
     assert first["nvc_function_response_consumed_generation"].tolist() == [3]
+    assert first["nvc_tool_step"].tolist() == [True]
 
     s.add_multimodal_tensor({"nvc_function_token": torch.tensor([7])}, mm_type=LATENT)
     second = s._new_completion_output([2], None, None).multimodal_output
     assert second["nvc_function_token"].tolist() == [7]
     assert "nvc_function_response_consumed_generation" not in second
+    assert "nvc_tool_step" not in second
+    assert "nvc_function_token_forced" not in second
 
 
 def test_finish_consolidation_for_hs_delta():
